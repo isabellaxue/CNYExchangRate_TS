@@ -1,0 +1,259 @@
+---
+title: "Time Series Final Project"
+author: "Isabella Xue"
+date: '2023-05-24'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(imputeTS)
+library(forecast)
+library(tseries)
+library(ggplot2)
+```
+
+### Rubrics
+
+> 1. Problem statement
+2. Assumptions/Hypotheses about data and/or modeling
+3. Data properties (stationarity, correlations, data distribution) and Exploratory data analysis
+4. Data processing (anomaly detection, cleansing and imputations) and transformations
+5. Feature engineering
+6. Proposed approaches (model) with justification and trade-offs, if any
+7. Results (accuracy) and learnings from the methodology
+8. Future work
+
+
+## 1. Problem statement
+
+Create a robust time series forecasting model to accurately predict the daily exchange rate between the Chinese Yuan (CNY) and the US Dollar (USD), based on historical data from January 4, 2010, to May 19, 2023.
+
+Goal: This model should be able to identify patterns and trends in the data in order to generate reliable predictions for future exchange rates and adjust predictions in the event of unexpected fluctuations and unforeseen circumstances.
+
+Significance: Forecasting the CNY exchange rate provides valuable information to businesses/individuals engaged in import/export activities, helping them manage currency risks and make informed investment decisions.
+
+## 2. Assumptions/Hypotheses
+
+Assumptions:
+
+- Independence: The observations are independent of each other, which means that the value of the exchange rate on a given day is not influenced by the values on preceding or subsequent days.
+
+- Model Stability: Forecasting models assume that the relationships and patterns observed in the historical data will remain stable and hold true in the future. This assumption implies that the factors influencing the target variable will not undergo significant changes or structural shifts.
+
+Hypotheses:
+
+- Efficient Market Hypothesis: The exchange rate reflects all available information and adjusts instantaneously to new information.
+
+- Autocorrelation: The exchange rate exhibits autocorrelation, meaning that the current value of the exchange rate is related to its previous values. 
+
+## 3. Data processing (anomaly detection, cleansing and imputations) and transformations
+
+```{r}
+#df <- read.csv('FRB_H10.csv', skip=1) %>% rename(Date = Time.Period, CNY = RXI_N.B.CH) 
+df <- read.csv('FRB_H10.csv', skip=1) %>% rename(Date = Time.Period, CNY = RXI_N.B.CH) %>% dplyr::filter(Date >= as.Date('2010-01-01'))
+
+#df <- read.csv('euro-daily-hist_1999_2022.csv') %>% select(Period.Unit., X.US.dollar..) %>% rename(Date = `Period.Unit.`, CNY = `X.US.dollar..`)
+
+head(df)
+
+```
+
+Anomaly detection, cleansing:
+
+```{r}
+# Check for duplicated rows based on the "Date" column
+duplicated_rows <- anyDuplicated(df$Date)
+cat("There is", duplicated_rows, "duplicated rows in Date column \n")
+
+# Convert the "Date" column to Date format
+df$Date <- as.Date(df$Date)
+
+# Check for missing values in the "CNY" column
+#CNY = ND is missing value
+missing_values <- sum(is.na(df$CNY))
+cat("There is", missing_values, "values in CNY column that is null \n")
+table(df$CNY == "ND")
+#143 missing values in CNY
+
+#Remove the rows where CNY equals to ND
+df <- df[df$CNY != 'ND', ]
+
+# Check for consecutive dates and print missing dates
+all_dates <- seq(min(df$Date), max(df$Date), by = "day")
+missing_dates <- setdiff(all_dates, df$Date)
+cat("There are", length(missing_dates), "days missing from the data")
+```
+
+```{r}
+# Create a new data frame with the complete sequence of dates
+complete_df <- data.frame(Date = all_dates)
+
+# Merge the complete data frame with the original data frame, keeping only the missing dates
+missing_dates_df <- merge(complete_df, df, by = "Date", all.x = TRUE)
+
+# Set CNY values to null for missing dates
+missing_dates_df$CNY[is.na(missing_dates_df$CNY)] <- NA
+```
+
+Imputations and Data Transformation: 
+
+```{r}
+ts_data <- ts(as.double(missing_dates_df$CNY))
+ts_data_interp <- na.interp(ts_data, lambda = "auto")
+
+ggplot_na_imputations(x_with_na = ts(as.double(missing_dates_df$CNY)), x_with_imputations = ts_data_interp, 
+                      title = "CNY-USD Exchange Rate",
+                      x_axis_labels = all_dates,
+                      xlab = "Date", ylab = "Exchange Rate",
+                      size_points = 2.5,
+                      size_imputations = 1)
+
+#Final dataframe
+df_interp <- missing_dates_df %>% mutate(CNY = ts_data_interp)
+```
+
+
+## 4. Data properties (stationarity, correlations, data distribution) and Exploratory data analysis
+
+```{r warning=FALSE}
+#stationarity
+ts_obj <- ts(df_interp$CNY, start = c(2010, as.numeric(format(all_dates[1], "%j"))), frequency = 365)
+adf_test <- adf.test(ts_obj)
+kpss_test <- kpss.test(ts_obj)
+print(adf_test)
+print(kpss_test)
+
+#autocorrelations
+acf(ts_obj, main = "Autocorrelation Function (ACF) Plot")
+
+#Distribution
+ggplot(df_interp, aes(x=CNY)) + 
+  geom_histogram(fill="deepskyblue3", color="lightblue") +
+  labs(title="CNY Daily Exchange Rate Histogram",x="Exchange Rate", y = "Count") +
+  theme_minimal() + theme(plot.title = element_text(hjust = 0.5)) +
+  scale_x_continuous(breaks=scales::pretty_breaks(10))
+
+#trend, seasonality
+decomposition <- decompose(ts_obj)
+plot(decomposition)
+
+```
+
+
+I observe:
+
+- ADF and KPSS shows that CNY exchange rate time series is non-stationary. 
+
+- Acf plot indicates high autocorrelation.
+
+- Distribution does not show specific pattern. 
+
+- Trend and high seasonality.
+
+## 5. Feature Engineering
+
+```{r}
+# Create a time series object for training and testing
+train_ts <- head(ts_obj, -50)
+
+test_ts <- tail(ts_obj, 50)
+```
+
+
+## 6. Proposed Approaches
+
+### Holt-Winters
+
+```{r}
+hw_model <- HoltWinters(train_ts)
+summary(hw_model)
+
+hw_forecast <- forecast(hw_model, h = length(test_ts))
+hw_mse <- mean((hw_forecast$mean - test_ts)^2)
+hw_rmse <- sqrt(mean((c(hw_forecast$mean) - c(test_ts))^2))
+hw_mape <- mean(abs((c(hw_forecast$mean) - c(test_ts)) / test_ts)) * 100
+
+print(paste("Holt-Winters forecast MSE:", hw_mse))
+print(paste("Holt-Winters forecast RMSE:", hw_rmse))
+print(paste("Holt-Winters forecast MAPE:", hw_mape, "%"))
+
+```
+
+### SARIMA:
+
+```{r}
+# Fit the SARIMA model to the differenced series
+sarima_model <- auto.arima(train_ts)
+summary(sarima_model)
+
+# Generate forecasts using the SARIMA model
+sarima_forecast <- forecast(sarima_model, h = length(test_ts))
+
+# Evaluate the model's performance
+sarima_mse <- mean((sarima_forecast$mean - test_ts)^2)
+sarima_rmse <- sqrt(mean((c(sarima_forecast$mean)-c(test_ts))^2))
+sarima_mape <- mean(abs((c(sarima_forecast$mean)-c(test_ts)) / test_ts)) * 100
+
+# Print the evaluation metrics
+print(paste("SARIMA forecast MSE:", sarima_mse))
+print(paste("SARIMA forecast RMSE:", sarima_rmse))
+print(paste("SARIMA forecast MAPE:", sarima_mape, "%"))
+```
+
+
+### ARFIMA
+
+```{r}
+arfima_model <- forecast::arfima(train_ts)
+summary(arfima_model)
+
+arfima_forecast <- forecast::forecast(arfima_model, h = length(test_ts))
+arfima_mse <- mean((arfima_forecast$mean - test_ts)^2)
+arfima_rmse <- sqrt(mean((c(arfima_forecast$mean) - c(test_ts))^2))
+arfima_mape <- mean(abs((c(arfima_forecast$mean) - c(test_ts)) / test_ts)) * 100
+
+print(paste("ARFIMA forecast MSE:", sarima_mse))
+print(paste("ARFIMA forecast RMSE:", arfima_rmse))
+print(paste("ARFIMA forecast MAPE:", arfima_mape, "%"))
+```
+
+
+## 7. Results and learnings from the methodology
+
+Visualizing Actual vs. Forecast:
+
+```{r}
+results_df <- data.frame(Date = tail(df_interp$Date, 50), Actual = as.vector(test_ts),
+                 HoltWinters = as.vector(hw_forecast$mean),
+                 SARIMA = as.vector(sarima_forecast$mean),
+                 ARFIMA = as.vector(arfima_forecast$mean))
+
+# Create the plot
+ggplot(data = results_df, aes(x = Date)) +
+  geom_line(aes(y = Actual, color = "Actual"), size = 1) +
+  geom_line(aes(y = HoltWinters, color = "Holt-Winters"), size = 1, linetype = "dashed") +
+  geom_line(aes(y = SARIMA, color = "SARIMA"), size = 1, linetype = "dotted") +
+  geom_line(aes(y = ARFIMA, color = "ARFIMA"), size = 1, linetype = "dotdash") +
+  labs(x = "Date", y = "Exchange Rate", title = "Forecast Comparison") +
+  scale_color_manual(values = c("Actual" = "black", "Holt-Winters" = "blue",
+                                "SARIMA" = "red", "ARFIMA" = "green")) +
+  theme_minimal() + theme(plot.title = element_text(hjust = 0.5))
+```
+
+## 8. Future Work
+
+Limitations:
+
+- Interpolation estimates missing values based on nearby observations, but it can't capture long-term trends and patterns in the data if the missing values are spread out over time. This can result in a loss of info and can affect accuracy of long-term forecasts.
+
+Future works:
+
+- Incorporating relevant external factors, such as economic indicators, interest rates, or geopolitical events, into the forecasting models
+
+- Exploring more advanced time series models beyond SARIMA, ARFIMA, and Holt-Winters
+
+- Extending the analysis to real-time forecasting, where new data is continuously incorporated into the models
+
+
